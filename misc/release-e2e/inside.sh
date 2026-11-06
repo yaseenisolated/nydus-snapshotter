@@ -77,16 +77,16 @@ n pull -q --platform linux/amd64 "$IMAGE" >/dev/null
 step "pulled image"
 n create -q --platform linux/amd64 --net none --name c1 "$IMAGE" true >/dev/null
 step "created container c1"
-n create -q --platform linux/amd64 --net none --name c2 "$IMAGE" true >/dev/null
-step "created container c2 (same image)"
+t0=$(date +%s%N); n create -q --platform linux/amd64 --net none --name c2 "$IMAGE" true >/dev/null
+step "created container c2 (same image)"; echo "  c2 create, nydusd already running: $(( ($(date +%s%N) - t0) / 1000000 )) ms"
 rm_and_wait c1
 step "removed c1"
 rm_and_wait c2
 # The fix stops nydusd at the end of Remove; give it up to 10s to exit.
 for _ in $(seq 100); do [ "$(daemons)" -eq 0 ] && break; sleep 0.1; done
 step "removed c2 (last container)"
-n create -q --platform linux/amd64 --net none --name c3 "$IMAGE" true >/dev/null
-step "created c3 (same image again)"
+t0=$(date +%s%N); n create -q --platform linux/amd64 --net none --name c3 "$IMAGE" true >/dev/null
+step "created c3 (same image again)"; echo "  c3 create, nydusd restarted: $(( ($(date +%s%N) - t0) / 1000000 )) ms"
 
 mnt=$(grep -oE '/var/lib/containerd-nydus/snapshots/[0-9]+/mnt' /proc/mounts | head -1)
 echo "c3 image mount ${mnt:-<none>}: $(ls "${mnt:-/nonexistent}" 2>/dev/null | tr '\n' ' ')"
