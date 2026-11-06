@@ -594,6 +594,9 @@ func (fs *Filesystem) Umount(_ context.Context, snapshotID string) error {
 				return errors.Wrapf(err, "destroy daemon %s", daemon.ID())
 			}
 		}
+		// Otherwise a later Mount of the same snapshot sees "already exists" and
+		// waits on the destroyed daemon.
+		racache.RafsGlobalCache.Remove(snapshotID)
 	case config.FsDriverBlockdev:
 		if err := fs.tarfsMgr.UmountTarErofs(snapshotID); err != nil {
 			return errors.Wrapf(err, "umount tar erofs on snapshot %s", snapshotID)
