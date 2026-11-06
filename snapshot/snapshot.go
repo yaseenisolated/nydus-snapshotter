@@ -63,6 +63,7 @@ type snapshotter struct {
 	syncRemove              bool
 	cleanupOnClose          bool
 	enableOverlayfsVolatile bool
+	umountIfUnused          func(ctx context.Context, metaID string, inUse func() (bool, error)) error
 }
 
 func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapshots.Snapshotter, error) {
@@ -314,6 +315,7 @@ func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapsho
 		enableKataVolume:        cfg.SnapshotsConfig.EnableKataVolume,
 		enableOverlayfsVolatile: cfg.SnapshotsConfig.EnableOverlayfsVolatile,
 		cleanupOnClose:          cfg.CleanupOnClose,
+		umountIfUnused:          nydusFs.UmountIfUnused,
 	}, nil
 }
 
@@ -638,6 +640,10 @@ func (o *snapshotter) Remove(ctx context.Context, key string) error {
 	if timer := collector.NewSnapshotMetricsTimer(collector.SnapshotMethodRemove); timer != nil {
 		defer timer.ObserveDuration()
 	}
+	// Resolved before the write transaction: findMetaLayer opens its own.
+	baseCtx := ctx
+	metaID := o.containerImage(ctx, key)
+
 	ctx, t, err := o.ms.TransactionContext(ctx, true)
 	if err != nil {
 		return err
@@ -694,7 +700,60 @@ func (o *snapshotter) Remove(ctx context.Context, key string) error {
 		}()
 	}
 
-	return t.Commit()
+	if err = t.Commit(); err != nil {
+		return err
+	}
+	if metaID != "" {
+		o.releaseImage(baseCtx, metaID)
+	}
+	return nil
+}
+
+// containerImage returns the nydus meta snapshot ID under a container (Active) or
+// View snapshot, or "" for anything else.
+func (o *snapshotter) containerImage(ctx context.Context, key string) string {
+	_, info, _, err := snapshot.GetSnapshotInfo(ctx, o.ms, key)
+	if err != nil || (info.Kind != snapshots.KindActive && info.Kind != snapshots.KindView) {
+		return ""
+	}
+	id, _, err := o.findMetaLayer(ctx, key)
+	if err != nil {
+		return ""
+	}
+	return id
+}
+
+// releaseImage stops the dedicated nydusd serving image metaID once no container
+// or view uses it any more. The next container's Prepare mounts a fresh one.
+// Prepare commits the container's snapshot before mounting, so imageInUse can't
+// miss a container that is starting.
+func (o *snapshotter) releaseImage(ctx context.Context, metaID string) {
+	inUse := func() (bool, error) { return o.imageInUse(ctx, metaID) }
+	if err := o.umountIfUnused(ctx, metaID, inUse); err != nil {
+		log.G(ctx).WithError(err).Warnf("failed to release nydusd of image snapshot %s", metaID)
+	}
+}
+
+func (o *snapshotter) imageInUse(ctx context.Context, metaID string) (bool, error) {
+	var users []string
+	if err := o.Walk(ctx, func(_ context.Context, i snapshots.Info) error {
+		if i.Kind == snapshots.KindActive || i.Kind == snapshots.KindView {
+			users = append(users, i.Name)
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	for _, key := range users {
+		id, _, err := o.findMetaLayer(ctx, key)
+		if errdefs.IsNotFound(err) {
+			continue
+		}
+		if err != nil || id == metaID {
+			return true, err
+		}
+	}
+	return false, nil
 }
 
 func (o *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
@@ -1281,10 +1340,23 @@ func (o *snapshotter) cleanupSnapshotDirectory(ctx context.Context, dir string) 
 	return nil
 }
 
+// cachedImageBlobIDs returns the blob IDs of all nydus data layers in the store.
+// ctx must carry a metastore transaction.
+func cachedImageBlobIDs(ctx context.Context) (map[string]bool, error) {
+	ids := make(map[string]bool)
+	err := storage.WalkInfo(ctx, func(_ context.Context, i snapshots.Info) error {
+		if digest := i.Labels[label.CRILayerDigest]; label.IsNydusDataLayer(i.Labels) && digest != "" {
+			ids[strings.TrimPrefix(digest, "sha256:")] = true
+		}
+		return nil
+	})
+	return ids, err
+}
+
 func (o *snapshotter) getUnusedCacheBlobs(ctx context.Context) ([]string, error) {
 	// Get a write transaction to ensure no other write transaction can be entered
 	// while the cleanup is scanning.
-	_, t, err := o.ms.TransactionContext(ctx, true)
+	txCtx, t, err := o.ms.TransactionContext(ctx, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1295,8 +1367,12 @@ func (o *snapshotter) getUnusedCacheBlobs(ctx context.Context) ([]string, error)
 		}
 	}()
 
-	// Collect all used blob IDs from all daemons
-	usedBlobIDs := make(map[string]bool)
+	// Blobs of every image still on the node are used, even with no nydusd
+	// running for it: releaseImage stops daemons of images without containers.
+	usedBlobIDs, err := cachedImageBlobIDs(txCtx)
+	if err != nil {
+		return nil, errors.Wrap(err, "collect blobs of cached images")
+	}
 	if err := o.fs.WalkManagers(func(mgr *mgr.Manager) error {
 		for _, d := range mgr.ListDaemons() {
 			// Get all rafs instances for this daemon
