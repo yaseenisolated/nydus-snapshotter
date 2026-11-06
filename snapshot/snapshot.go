@@ -64,7 +64,6 @@ type snapshotter struct {
 	cleanupOnClose          bool
 	enableOverlayfsVolatile bool
 	cleanupQueue            *snapshotCleanupQueue
-	umountIfUnused          func(ctx context.Context, metaID string, inUse func() (bool, error)) error
 }
 
 func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapshots.Snapshotter, error) {
@@ -311,7 +310,6 @@ func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapsho
 		enableKataVolume:        cfg.SnapshotsConfig.EnableKataVolume,
 		enableOverlayfsVolatile: cfg.SnapshotsConfig.EnableOverlayfsVolatile,
 		cleanupOnClose:          cfg.CleanupOnClose,
-		umountIfUnused:          nydusFs.UmountIfUnused,
 	}
 	if config.GetFsDriver() == config.FsDriverFscache && !syncRemove {
 		log.L.Infof("enable async snapshot cleanup for fscache mode")
@@ -773,7 +771,7 @@ func (o *snapshotter) containerImage(ctx context.Context, key string) string {
 // miss a container that is starting.
 func (o *snapshotter) releaseImage(ctx context.Context, metaID string) {
 	inUse := func() (bool, error) { return o.imageInUse(ctx, metaID) }
-	if err := o.umountIfUnused(ctx, metaID, inUse); err != nil {
+	if err := o.fs.UmountIfUnused(ctx, metaID, inUse); err != nil {
 		log.G(ctx).WithError(err).Warnf("failed to release nydusd of image snapshot %s", metaID)
 	}
 }
